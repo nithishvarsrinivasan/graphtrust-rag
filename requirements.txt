@@ -1,0 +1,9 @@
+# Pinned to avoid the transformers v5.x / ColBERT HF_ColBERT
+# `all_tied_weights_keys` crash you already hit and fixed in Stage 0.
+transformers==4.46.3
+
+datasets
+openai
+faiss-cpu
+ujson
+sentence-transformers

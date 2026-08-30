@@ -1,0 +1,16 @@
+# Generated data - regenerate from HotpotQA, don't commit
+data/
+indexes/
+experiments/
+
+# ColBERT clones itself into a subfolder if you clone it inside the repo -
+# don't commit stanford-futuredata's code as part of yours
+ColBERT/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Secrets - never commit an API key
+.env
