@@ -1,10 +1,4 @@
-"""
-generator.py
-------------
-Extracted from your notebook cells 25-26, unchanged - this is the
-version with the reasoning-effort cap and empty-content diagnostic you
-already fixed.
-"""
+import time
 
 from openai import OpenAI
 
@@ -46,7 +40,7 @@ def build_rag_prompt(question, retrieved_chunks):
     )
 
 
-def generate_answer(question, retrieved_chunks):
+def generate_answer(question, retrieved_chunks, _retries=2):
     client = get_client()
     user_prompt = build_rag_prompt(question, retrieved_chunks)
 
@@ -60,6 +54,25 @@ def generate_answer(question, retrieved_chunks):
         ],
         extra_body={"reasoning": {"effort": "low"}},
     )
+
+    # response.choices can come back None (not an empty list) when
+    # OpenRouter hits a transient provider error or rate limit on the
+    # free tier - this is what was crashing before with a bare
+    # TypeError on response.choices[0]. Retry a couple times first,
+    # since free-tier hiccups are often transient.
+    if not response.choices:
+        raw = response.model_dump() if hasattr(response, "model_dump") else str(response)
+        if _retries > 0:
+            print(f"[generator] No choices returned (likely a transient "
+                  f"provider/rate-limit error). Retrying... "
+                  f"({_retries} attempt(s) left)")
+            print(f"[generator] Raw response: {raw}")
+            time.sleep(3)
+            return generate_answer(question, retrieved_chunks, _retries=_retries - 1)
+        raise RuntimeError(
+            f"API returned no choices after retries - this is a provider-side "
+            f"error, not a token-budget issue. Raw response:\n{raw}"
+        )
 
     message = response.choices[0].message
     content = (message.content or "").strip()
