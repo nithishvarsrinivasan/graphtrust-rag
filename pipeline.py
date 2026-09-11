@@ -1,21 +1,18 @@
-"""
-pipeline.py
------------
-Extracted from your notebook cells 28-29, unchanged.
-"""
-
 import data_loader
 import generator
 import retriever
 
 
 class BaseRAGPipeline:
-    def __init__(self, corpus=None, questions=None):
+    def __init__(self, corpus=None, questions=None, index_name=None, force_rebuild=False):
         if corpus is None or questions is None:
             corpus, questions = data_loader.prepare_corpus_and_questions()
         self.corpus = corpus
         self.questions = questions
-        self.retriever = retriever.get_or_build_retriever(corpus)
+        self.index_name = index_name
+        self.retriever = retriever.get_or_build_retriever(
+            corpus, index_name=index_name, force_rebuild=force_rebuild
+        )
 
     def retrieve(self, question, k=None):
         return self.retriever.search(question, k=k)
