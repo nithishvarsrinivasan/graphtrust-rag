@@ -9,12 +9,15 @@ def _collection_from_corpus(corpus):
     return texts, id_map
 
 
-def index_exists():
-    index_path = os.path.join(config.COLBERT_INDEX_ROOT, config.COLBERT_INDEX_NAME)
+def index_exists(index_name=None):
+    index_name = index_name or config.COLBERT_INDEX_NAME
+    index_path = os.path.join(config.COLBERT_INDEX_ROOT, index_name)
     return os.path.exists(index_path)
 
 
-def build_index(corpus):
+def build_index(corpus, index_name=None):
+    index_name = index_name or config.COLBERT_INDEX_NAME
+
     print("Loading Indexer...")
     from colbert import Indexer
     from colbert.infra import Run, RunConfig, ColBERTConfig
@@ -26,16 +29,18 @@ def build_index(corpus):
         print("Creating Indexer...")
         indexer = Indexer(checkpoint=config.COLBERT_CHECKPOINT, config=cfg)
         print("Starting indexing...")
-        indexer.index(name=config.COLBERT_INDEX_NAME, collection=texts, overwrite=True)
+        indexer.index(name=index_name, collection=texts, overwrite=True)
         print("Finished indexing.")
-    print(f"Indexed {len(texts)} passages as '{config.COLBERT_INDEX_NAME}'.")
+    print(f"Indexed {len(texts)} passages as '{index_name}'.")
     return id_map
 
 
 class ColBERTRetriever:
-    def __init__(self, corpus, id_map=None):
+    def __init__(self, corpus, id_map=None, index_name=None):
         from colbert import Searcher
         from colbert.infra import Run, RunConfig, ColBERTConfig
+
+        index_name = index_name or config.COLBERT_INDEX_NAME
 
         self.corpus = corpus
         self.corpus_by_position = {i: corpus[i] for i in range(len(corpus))}
@@ -43,7 +48,7 @@ class ColBERTRetriever:
 
         with Run().context(RunConfig(nranks=1, experiment="graphtrust", avoid_fork_if_possible=True)):
             cfg = ColBERTConfig(root=config.COLBERT_INDEX_ROOT)
-            self.searcher = Searcher(index=config.COLBERT_INDEX_NAME, config=cfg)
+            self.searcher = Searcher(index=index_name, config=cfg)
 
     def search(self, query, k=None):
         k = k or config.TOP_K
@@ -61,11 +66,19 @@ class ColBERTRetriever:
         return results
 
 
-def get_or_build_retriever(corpus):
+def get_or_build_retriever(corpus, index_name=None, force_rebuild=False):
+    """
+    index_name lets you keep multiple indexes on disk side by side (e.g.
+    a clean baseline index and a separately-named poisoned index) instead
+    of the poisoned build silently overwriting your baseline.
+    force_rebuild=True skips the "reuse if exists" check - use this when
+    you've changed the corpus content but kept the same index_name.
+    """
+    index_name = index_name or config.COLBERT_INDEX_NAME
     id_map = {i: corpus[i]["id"] for i in range(len(corpus))}
-    if not index_exists():
-        id_map = build_index(corpus)
-    return ColBERTRetriever(corpus, id_map=id_map)
+    if force_rebuild or not index_exists(index_name):
+        id_map = build_index(corpus, index_name=index_name)
+    return ColBERTRetriever(corpus, id_map=id_map, index_name=index_name)
 
 
 if __name__ == "__main__":
