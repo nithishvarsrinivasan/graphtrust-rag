@@ -1,15 +1,11 @@
 """
+
 Design goal: everything in THIS file runs on CPU with no GPU dependency,
 so you can develop and debug it entirely in VS Code. It only needs:
   - the OpenRouter API (to generate/refine adversarial passage text)
   - sentence-transformers (small model, CPU-friendly) for a cheap
     similarity-based feedback signal between refinement rounds
 
-The expensive step - rebuilding the real ColBERT index with the final
-crafted passage injected, then re-running the pipeline to check if the
-attack worked - happens in `inject_and_evaluate()` at the bottom, which
-you run in Colab (it imports retriever.py / pipeline.py, which need the
-GPU-backed ColBERT index).
 
 How the iterative refinement works (simplified FHM-ISO idea):
   Round 0: ask the LLM to draft a passage that (a) reads naturally,
@@ -144,14 +140,17 @@ def draft_passage(question, target_false_answer, previous_draft=None, previous_s
 
     response = _chat_completion_with_retry(
         client,
-        model=config.GENERATOR_MODEL,
+        model=config.ATTACK_MODEL,
         max_tokens=400,
         temperature=0.7,  # some variation helps refinement actually change things
         messages=[
             {"role": "system", "content": ATTACK_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        extra_body={"reasoning": {"effort": "low"}},
+        # If the primary model is rate-limited upstream (e.g. a shared
+        # provider pool getting hit), OpenRouter automatically tries the
+        # next model in this list instead of failing outright.
+        extra_body={"models": config.ATTACK_MODEL_FALLBACKS},
     )
 
     content = (response.choices[0].message.content or "").strip()
@@ -166,7 +165,7 @@ def draft_passage(question, target_false_answer, previous_draft=None, previous_s
         raise RuntimeError(
             f"Model produced meta-commentary/refusal instead of the "
             f"passage itself:\n\"{content[:200]}...\"\n"
-            f"Try rewording ATTACK_SYSTEM_PROMPT, or switch GENERATOR_MODEL "
+            f"Try rewording ATTACK_SYSTEM_PROMPT, or switch ATTACK_MODEL "
             f"to a different free-tier model for attack drafting specifically."
         )
 
@@ -201,8 +200,8 @@ def generate_plausible_false_answer(question, true_answer):
     client = get_client()
     response = _chat_completion_with_retry(
         client,
-        model=config.GENERATOR_MODEL,
-        max_tokens=150,  # headroom for reasoning tokens; answer itself should still be short
+        model=config.ATTACK_MODEL,
+        max_tokens=50,  # plain instruct model, no reasoning phase to budget for
         temperature=0.7,
         messages=[
             {"role": "system", "content": FALSE_ANSWER_SYSTEM_PROMPT},
@@ -212,7 +211,7 @@ def generate_plausible_false_answer(question, true_answer):
                 f"Alternative (false) answer:"
             )},
         ],
-        extra_body={"reasoning": {"effort": "low"}},
+        extra_body={"models": config.ATTACK_MODEL_FALLBACKS},
     )
 
     raw_content = (response.choices[0].message.content or "").strip()
@@ -307,8 +306,13 @@ def craft_batch_of_attacks(questions, num_rounds=None, verbose=True):
         print(f"{'=' * 70}")
 
         try:
-            false_answer = generate_plausible_false_answer(question, true_answer)
-            print(f"Auto-generated false answer: {false_answer}")
+            manual_override = config.ATTACK_MANUAL_FALSE_ANSWERS.get(str(q["id"]))
+            if manual_override:
+                false_answer = manual_override
+                print(f"Using manual override false answer: {false_answer}")
+            else:
+                false_answer = generate_plausible_false_answer(question, true_answer)
+                print(f"Auto-generated false answer: {false_answer}")
 
             best = craft_adversarial_passage(
                 question=question,
