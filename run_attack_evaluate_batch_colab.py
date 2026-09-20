@@ -1,22 +1,3 @@
-"""
-run_attack_evaluate_batch_colab.py
-------------------------------------
-Run this IN COLAB (GPU runtime). Loads attack_output_batch.json (crafted
-locally, git-pulled here), then:
-
-  1. Builds/reuses the CLEAN baseline index (your normal one - unchanged)
-     and records the baseline answer for all 20 questions.
-  2. Builds ONE poisoned index = clean corpus + all 20 adversarial
-     passages appended (each id offset, each targeting a different
-     question) - only ONE extra index build, not 20.
-  3. Re-asks all 20 questions against the poisoned index and checks,
-     per question: was ITS OWN adversarial passage retrieved, and did
-     the false answer make it into the output.
-  4. Reports an overall Attack Success Rate (ASR) across the batch.
-
-Saves full per-question results to attack_evaluation_batch.json.
-"""
-
 import json
 
 import config
@@ -30,7 +11,7 @@ def main():
         attacks = json.load(f)
     print(f"Loaded {len(attacks)} crafted attacks.")
 
-    # ---- Step 1: baseline (clean index, unchanged) ----
+
     print("\n" + "=" * 70)
     print("STEP 1: BASELINE (clean index, all questions)")
     print("=" * 70)
@@ -42,7 +23,7 @@ def main():
         baselines[a["question_id"]] = result["answer"]
         print(f"  [{a['question_id']}] baseline: {result['answer'][:100]}")
 
-    # ---- Step 2: build ONE poisoned corpus with all 20 injected ----
+    
     print("\n" + "=" * 70)
     print("STEP 2: BUILDING POISONED INDEX (clean corpus + 20 adversarial passages)")
     print("=" * 70)
@@ -60,10 +41,9 @@ def main():
         corpus=poisoned_corpus,
         questions=pipeline.questions,
         index_name=POISONED_INDEX_NAME,
-        force_rebuild=True,  # corpus content changed - must rebuild even if this name exists from a previous run
-    )
+        force_rebuild=True, )
 
-    # ---- Step 3: re-ask all 20 against the poisoned index ----
+    
     print("\n" + "=" * 70)
     print("STEP 3: RE-ASKING ALL QUESTIONS AGAINST POISONED INDEX")
     print("=" * 70)
@@ -94,6 +74,13 @@ def main():
             "post_attack_answer": result["answer"],
             "was_retrieved": was_retrieved,
             "attack_succeeded": attack_succeeded,
+            # Full retrieved chunk set + which one is the adversarial
+            # passage - needed by claim_extraction.py / the NLI graph so
+            # Stage 2 can run on real pipeline output instead of
+            # hand-copied text.
+            "retrieved_chunks": result["retrieved_chunks"],
+            "adversarial_chunk_id": adversarial_id,
+            "adversarial_passage": a["adversarial_passage"],
         }
         results.append(entry)
 
@@ -102,7 +89,7 @@ def main():
         print(f"      baseline: {baselines[qid][:80]}")
         print(f"      poisoned: {result['answer'][:80]}")
 
-    # ---- Step 4: summary ----
+    #summary 
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
