@@ -137,7 +137,7 @@ def ask(question: str, verbose: bool = True) -> dict:
 
     # 5. Generate answer from clean context
     from generator import generate_answer
-    answer = generate_answer(question, clean_context)
+    answer = generate_answer(question, trusted_chunks)
 
     # 6. Print defense report
     if verbose:
