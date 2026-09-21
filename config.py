@@ -31,13 +31,16 @@ GENERATOR_MAX_TOKENS = 1536  # bumped from 512 per your earlier fix
 GENERATOR_TEMPERATURE = 0.0
 
 # ---------------------------------------------------------------------------
-# Stage 1: Attack simulation
 ATTACK_TARGET_QUESTION_ID = '5ae6b6065542991bbc976168'
 ATTACK_TARGET_FALSE_ANSWER = "Tom Hardy"
 ATTACK_MODEL = "nex-agi/nex-n2.5-mini:free"
+ATTACK_MODEL_FALLBACKS = []  
 
 
 ATTACK_NUM_ROUNDS = 5              # how many refinement rounds to run
 ATTACK_SIMILARITY_MODEL = "all-MiniLM-L6-v2"  # small, CPU-friendly, no GPU needed
 
+
 ATTACK_MANUAL_FALSE_ANSWERS = {}
+# ---------------------------------------------------------------------------
+NLI_MODEL = "cross-encoder/nli-deberta-v3-small"
