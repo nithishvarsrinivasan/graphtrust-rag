@@ -178,14 +178,7 @@ def ask(question: str, verbose: bool = True) -> dict:
 
     # 3. Flag each chunk
     flagged = flag_chunks(chunks, trust_scores, G)
-    for chunk in chunks:
-        cid = chunk["id"]
-        score = trust_scores.get(cid, 0.0)
-        flagged[cid] = {
-            "trust_score": round(score, 4),
-            "flag": "SUSPICIOUS" if score < SUSPICION_THRESHOLD else "TRUSTED",
-            "is_known_adversarial": cid in adversarial_ids,
-        }
+    
 
     # 4. Build clean context from trusted chunks only
     trusted_chunks = [
