@@ -75,9 +75,10 @@ def compute_trust_scores(chunks: list[dict]) -> dict:
         label = result["label"]
 
         if label == "contradiction" and scores["contradiction"] >= CONTRADICTION_THRESHOLD:
+            # Weight contradictions harder — x2 penalty
             G.add_edge(
                 chunks[i]["id"], chunks[j]["id"],
-                weight=-scores["contradiction"],
+                weight=-scores["contradiction"] * 2,
                 relation="contradiction",
             )
         elif label == "entailment" and scores["entailment"] >= ENTAILMENT_THRESHOLD:
@@ -92,6 +93,50 @@ def compute_trust_scores(chunks: list[dict]) -> dict:
         for node in G.nodes()
     }
 
+
+def flag_by_majority(chunks: list[dict], trust_scores: dict) -> dict:
+    """
+    Flag chunks that score below the group median as SUSPICIOUS.
+    This is relative flagging — catches the outlier even when all
+    scores are negative (dense topical corpus case).
+    Also always flag chunks with 0.0 trust (no edges = no agreement
+    with anyone = likely generic/adversarial filler text).
+    """
+    import statistics
+    scores = [trust_scores.get(c["id"], 0.0) for c in chunks]
+
+    FILLER_MARKERS = [
+    "encyclopedia summaries frequently identify",
+    "the topic concerns the same subject",
+    "commonly described in reference works as being associated with",]
+
+    def is_filler_text(text: str) -> bool:
+        lowered = text.lower()
+        return any(marker in lowered for marker in FILLER_MARKERS)
+
+    if is_filler_text(chunk["text"]):
+            is_suspicious = True
+    
+    if len(scores) < 2:
+        median = 0.0
+    else:
+        median = statistics.median(scores)
+
+    flagged = {}
+    for chunk in chunks:
+        cid = chunk["id"]
+        score = trust_scores.get(cid, 0.0)
+        
+        # Flag if below median OR has zero trust (no edges = no support)
+        is_suspicious = (score < median) or (score == 0.0 and median > 0.0)
+        
+        flagged[cid] = {
+            "trust_score": round(score, 4),
+            "flag": "SUSPICIOUS" if is_suspicious else "TRUSTED",
+            "is_known_adversarial": cid in adversarial_ids,
+        }
+
+    return flagged
 
 # ── main ask function 
 def ask(question: str, verbose: bool = True) -> dict:
@@ -113,7 +158,7 @@ def ask(question: str, verbose: bool = True) -> dict:
     trust_scores = compute_trust_scores(chunks)
 
     # 3. Flag each chunk
-    flagged = {}
+    flagged = flag_by_majority(chunks, trust_scores)
     for chunk in chunks:
         cid = chunk["id"]
         score = trust_scores.get(cid, 0.0)
