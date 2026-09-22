@@ -250,6 +250,57 @@ def ask(question: str, verbose: bool = True) -> dict:
         }
     }
 
+def run_batch_evaluation(
+    input_path="claim_extraction_output.json",
+    output_path="defense_results.json",
+):
+    """
+    Runs live defense on all questions from claim_extraction_output.json
+    and writes defense_results.json with final_answer included.
+    Used for evaluation metrics.
+    """
+    data = json.loads(Path(input_path).read_text())
+    results = []
+
+    for entry in data:
+        qid = entry["question_id"]
+        question = entry["question"]
+        true_answer = entry["true_answer"]
+        target_false_answer = entry["target_false_answer"]
+        adv_id = entry["adversarial_chunk_id"]
+
+        print(f"\n[eval] {qid[:20]}... | Q: {question[:60]}")
+
+        result = ask(question, verbose=True)
+
+        # Map chunk results to evaluation format
+        chunk_results = []
+        for c in result["chunks"]:
+            chunk_results.append({
+                "chunk_id": c["id"],
+                "trust_score": c["trust_score"],
+                "flag": c["flag"],
+                "is_adversarial": c["id"] == adv_id,
+            })
+
+        adv_chunk = next((c for c in chunk_results if c["is_adversarial"]), None)
+        adv_flagged = adv_chunk["flag"] == "SUSPICIOUS" if adv_chunk else False
+
+        results.append({
+            "question_id": qid,
+            "question": question,
+            "true_answer": true_answer,
+            "target_false_answer": target_false_answer,
+            "adversarial_chunk_id": adv_id,
+            "adversarial_chunk_flagged": adv_flagged,
+            "final_answer": result["answer"],        # ← what evaluate.py needs
+            "chunk_results": chunk_results,
+            "stats": result["stats"],
+        })
+
+    Path(output_path).write_text(json.dumps(results, indent=2))
+    print(f"\nBatch evaluation done → {output_path}")
+    return results
 
 # ── interactive loop 
 if __name__ == "__main__":
