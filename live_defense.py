@@ -105,23 +105,26 @@ def compute_trust_scores(chunks: list[dict]) -> dict:
 
 def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
     """
-    A chunk is SUSPICIOUS only if:
-      1. It is filler text (ChatGPT adversarial template), OR
-      2. It has more contradiction edges than entailment edges
-         AND at least one contradiction edge exists
-         AND it is the minority (contradicts more than half the other chunks)
-
-    Everything else is TRUSTED — we never flag real facts just because
-    the corpus is topically diverse.
+    Flag only on:
+    1. Filler text pattern (ChatGPT adversarial template) — always suspicious
+    2. Low retrieval score relative to top chunk — adversarial chunks
+       score noticeably lower than the passage ColBERT actually matched
+    NLI trust scores shown for research logging but not used for flagging
+    — too many false positives on topically diverse retrievals.
     """
-    n = len(chunks)
-    flagged = {}
+    if not chunks:
+        return {}
 
+    # Use ColBERT retrieval score as primary signal
+    max_score = max(c["score"] for c in chunks)
+    # Chunk is low-confidence if its score is less than 60% of top score
+    SCORE_RATIO_THRESHOLD = 0.60
+
+    flagged = {}
     for chunk in chunks:
         cid = chunk["id"]
         score = trust_scores.get(cid, 0.0)
 
-        # Count edges per type for this node
         contradiction_count = sum(
             1 for _, _, d in G.edges(cid, data=True)
             if d["relation"] == "contradiction"
@@ -131,17 +134,12 @@ def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
             if d["relation"] == "entailment"
         )
 
-        # Filler text — always flag
+        # Signal 1: filler text
         if is_filler_text(chunk["text"]):
             is_suspicious = True
 
-        # Contradicts majority of other chunks and has no entailment support
-        elif (
-            contradiction_count > 0
-            and contradiction_count > entailment_count
-            and contradiction_count >= (n - 1) // 2  # contradicts at least half
-            and entailment_count == 0                 # nobody agrees with it
-        ):
+        # Signal 2: retrieval score too low vs top chunk
+        elif chunk["score"] < max_score * SCORE_RATIO_THRESHOLD:
             is_suspicious = True
 
         else:
@@ -149,6 +147,7 @@ def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
 
         flagged[cid] = {
             "trust_score": round(score, 4),
+            "retrieval_score": round(chunk["score"], 4),
             "contradiction_count": contradiction_count,
             "entailment_count": entailment_count,
             "flag": "SUSPICIOUS" if is_suspicious else "TRUSTED",
@@ -156,7 +155,6 @@ def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
         }
 
     return flagged
-
 # ── main ask function 
 def ask(question: str, verbose: bool = True) -> dict:
 
@@ -208,6 +206,7 @@ def ask(question: str, verbose: bool = True) -> dict:
             sus_tag = " ← FLAGGED" if f["flag"] == "SUSPICIOUS" else ""
             print(
                 f"  [rank {chunk['rank']}] id={cid:<5} | "
+                f"ret={f['retrieval_score']:>6.3f} | "
                 f"trust={f['trust_score']:>7.4f} | "
                 f"contra={f['contradiction_count']} entail={f['entailment_count']} | "
                 f"{f['flag']}{sus_tag}{adv_tag}"
