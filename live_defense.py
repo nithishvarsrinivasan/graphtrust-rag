@@ -95,41 +95,31 @@ def compute_trust_scores(chunks: list[dict]) -> dict:
 
 
 def flag_by_majority(chunks: list[dict], trust_scores: dict) -> dict:
-    """
-    Flag chunks that score below the group median as SUSPICIOUS.
-    This is relative flagging — catches the outlier even when all
-    scores are negative (dense topical corpus case).
-    Also always flag chunks with 0.0 trust (no edges = no agreement
-    with anyone = likely generic/adversarial filler text).
-    """
     import statistics
-    scores = [trust_scores.get(c["id"], 0.0) for c in chunks]
 
     FILLER_MARKERS = [
-    "encyclopedia summaries frequently identify",
-    "the topic concerns the same subject",
-    "commonly described in reference works as being associated with",]
+        "encyclopedia summaries frequently identify",
+        "the topic concerns the same subject",
+        "commonly described in reference works as being associated with",
+    ]
 
     def is_filler_text(text: str) -> bool:
-        lowered = text.lower()
-        return any(marker in lowered for marker in FILLER_MARKERS)
+        return any(marker in text.lower() for marker in FILLER_MARKERS)
 
-    if is_filler_text(chunk["text"]):
-            is_suspicious = True
-    
-    if len(scores) < 2:
-        median = 0.0
-    else:
-        median = statistics.median(scores)
+    scores = [trust_scores.get(c["id"], 0.0) for c in chunks]
+    median = statistics.median(scores) if len(scores) >= 2 else 0.0
 
     flagged = {}
     for chunk in chunks:
         cid = chunk["id"]
         score = trust_scores.get(cid, 0.0)
-        
-        # Flag if below median OR has zero trust (no edges = no support)
-        is_suspicious = (score < median) or (score == 0.0 and median > 0.0)
-        
+
+        is_suspicious = (
+            score < median
+            or (score == 0.0 and median > 0.0)
+            or is_filler_text(chunk["text"])   # ← now inside the loop
+        )
+
         flagged[cid] = {
             "trust_score": round(score, 4),
             "flag": "SUSPICIOUS" if is_suspicious else "TRUSTED",
