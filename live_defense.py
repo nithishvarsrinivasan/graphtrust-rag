@@ -62,6 +62,16 @@ def classify_pair(claim_a: str, claim_b: str) -> dict:
 
 
 # ── graph trust scoring 
+FILLER_MARKERS = [
+    "encyclopedia summaries frequently identify",
+    "the topic concerns the same subject",
+    "commonly described in reference works as being associated with",
+]
+
+def is_filler_text(text: str) -> bool:
+    return any(marker in text.lower() for marker in FILLER_MARKERS)
+
+
 def compute_trust_scores(chunks: list[dict]) -> dict:
     G = nx.Graph()
     for chunk in chunks:
@@ -75,7 +85,6 @@ def compute_trust_scores(chunks: list[dict]) -> dict:
         label = result["label"]
 
         if label == "contradiction" and scores["contradiction"] >= CONTRADICTION_THRESHOLD:
-            # Weight contradictions harder — x2 penalty
             G.add_edge(
                 chunks[i]["id"], chunks[j]["id"],
                 weight=-scores["contradiction"] * 2,
@@ -91,37 +100,57 @@ def compute_trust_scores(chunks: list[dict]) -> dict:
     return {
         node: sum(d["weight"] for _, _, d in G.edges(node, data=True))
         for node in G.nodes()
-    }
+    }, G
 
 
-def flag_by_majority(chunks: list[dict], trust_scores: dict) -> dict:
-    import statistics
+def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
+    """
+    A chunk is SUSPICIOUS only if:
+      1. It is filler text (ChatGPT adversarial template), OR
+      2. It has more contradiction edges than entailment edges
+         AND at least one contradiction edge exists
+         AND it is the minority (contradicts more than half the other chunks)
 
-    FILLER_MARKERS = [
-        "encyclopedia summaries frequently identify",
-        "the topic concerns the same subject",
-        "commonly described in reference works as being associated with",
-    ]
-
-    def is_filler_text(text: str) -> bool:
-        return any(marker in text.lower() for marker in FILLER_MARKERS)
-
-    scores = [trust_scores.get(c["id"], 0.0) for c in chunks]
-    median = statistics.median(scores) if len(scores) >= 2 else 0.0
-
+    Everything else is TRUSTED — we never flag real facts just because
+    the corpus is topically diverse.
+    """
+    n = len(chunks)
     flagged = {}
+
     for chunk in chunks:
         cid = chunk["id"]
         score = trust_scores.get(cid, 0.0)
 
-        is_suspicious = (
-            score < median
-            or (score == 0.0 and median > 0.0)
-            or is_filler_text(chunk["text"])   # ← now inside the loop
+        # Count edges per type for this node
+        contradiction_count = sum(
+            1 for _, _, d in G.edges(cid, data=True)
+            if d["relation"] == "contradiction"
         )
+        entailment_count = sum(
+            1 for _, _, d in G.edges(cid, data=True)
+            if d["relation"] == "entailment"
+        )
+
+        # Filler text — always flag
+        if is_filler_text(chunk["text"]):
+            is_suspicious = True
+
+        # Contradicts majority of other chunks and has no entailment support
+        elif (
+            contradiction_count > 0
+            and contradiction_count > entailment_count
+            and contradiction_count >= (n - 1) // 2  # contradicts at least half
+            and entailment_count == 0                 # nobody agrees with it
+        ):
+            is_suspicious = True
+
+        else:
+            is_suspicious = False
 
         flagged[cid] = {
             "trust_score": round(score, 4),
+            "contradiction_count": contradiction_count,
+            "entailment_count": entailment_count,
             "flag": "SUSPICIOUS" if is_suspicious else "TRUSTED",
             "is_known_adversarial": cid in adversarial_ids,
         }
@@ -145,10 +174,10 @@ def ask(question: str, verbose: bool = True) -> dict:
         })
 
     # 2. Trust scoring via NLI + graph
-    trust_scores = compute_trust_scores(chunks)
+    trust_scores, G = compute_trust_scores(chunks)
 
     # 3. Flag each chunk
-    flagged = flag_by_majority(chunks, trust_scores)
+    flagged = flag_chunks(chunks, trust_scores, G)
     for chunk in chunks:
         cid = chunk["id"]
         score = trust_scores.get(cid, 0.0)
@@ -187,6 +216,7 @@ def ask(question: str, verbose: bool = True) -> dict:
             print(
                 f"  [rank {chunk['rank']}] id={cid:<5} | "
                 f"trust={f['trust_score']:>7.4f} | "
+                f"contra={f['contradiction_count']} entail={f['entailment_count']} | "
                 f"{f['flag']}{sus_tag}{adv_tag}"
             )
             print(f"    claim: {chunk['claim'][:110]}")
