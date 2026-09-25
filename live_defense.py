@@ -72,7 +72,14 @@ def is_filler_text(text: str) -> bool:
     return any(marker in text.lower() for marker in FILLER_MARKERS)
 
 
-def compute_trust_scores(chunks: list[dict]) -> dict:
+# ── WAT: Weighted Asymmetric Trust ────────────────────────────────────────
+W_SUPPORT    = 1.5
+W_OPPOSE     = 2.0
+W_ISOLATION  = 0.1
+WAT_THRESHOLD = -0.5   # tune this — start here
+
+
+def compute_wat_scores(chunks: list[dict]) -> tuple[dict, nx.Graph]:
     G = nx.Graph()
     for chunk in chunks:
         G.add_node(chunk["id"])
@@ -87,107 +94,96 @@ def compute_trust_scores(chunks: list[dict]) -> dict:
         if label == "contradiction" and scores["contradiction"] >= CONTRADICTION_THRESHOLD:
             G.add_edge(
                 chunks[i]["id"], chunks[j]["id"],
-                weight=-scores["contradiction"] * 2,
+                weight=scores["contradiction"],
                 relation="contradiction",
             )
         elif label == "entailment" and scores["entailment"] >= ENTAILMENT_THRESHOLD:
             G.add_edge(
                 chunks[i]["id"], chunks[j]["id"],
-                weight=+scores["entailment"],
+                weight=scores["entailment"],
                 relation="entailment",
             )
+        else:
+            G.add_edge(
+                chunks[i]["id"], chunks[j]["id"],
+                weight=0.0,
+                relation="neutral",
+            )
 
-    return {
-        node: sum(d["weight"] for _, _, d in G.edges(node, data=True))
-        for node in G.nodes()
-    }, G
+    max_ret = max(c["score"] for c in chunks)
+    score_lookup = {c["id"]: c["score"] for c in chunks}
+
+    wat_scores = {}
+    for chunk in chunks:
+        cid = chunk["id"]
+
+        support   = sum(d["weight"] for _, _, d in G.edges(cid, data=True) if d["relation"] == "entailment")
+        oppose    = sum(d["weight"] for _, _, d in G.edges(cid, data=True) if d["relation"] == "contradiction")
+        isolation = sum(1           for _, _, d in G.edges(cid, data=True) if d["relation"] == "neutral")
+
+        # ColBERT penalty: chunks ranked lower than top get amplified penalty
+        colbert_penalty = 1.0 + (max_ret - score_lookup[cid]) / (max_ret + 1e-9)
+
+        wat = (
+            support   * W_SUPPORT
+          - oppose    * W_OPPOSE * colbert_penalty
+          + isolation * W_ISOLATION
+        )
+
+        wat_scores[cid] = round(wat, 4)
+
+    return wat_scores, G
 
 
 def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
     if not chunks:
         return {}
 
-    max_score = max(c["score"] for c in chunks)
-    SCORE_RATIO_THRESHOLD = 0.60
-
-    # Build per-node edge counts
-    node_edges = {}
-    for chunk in chunks:
-        cid = chunk["id"]
-        contradiction_count = sum(
-            1 for _, _, d in G.edges(cid, data=True)
-            if d["relation"] == "contradiction"
-        )
-        entailment_count = sum(
-            1 for _, _, d in G.edges(cid, data=True)
-            if d["relation"] == "entailment"
-        )
-        node_edges[cid] = {
-            "contradiction_count": contradiction_count,
-            "entailment_count": entailment_count,
-        }
-
-    # Find contradiction pairs where scores are very close
-    # → flag the lower-scoring chunk in the pair
-    close_score_flagged = set()
-    for u, v, d in G.edges(data=True):
-        if d["relation"] == "contradiction":
-            u_score = next(c["score"] for c in chunks if c["id"] == u)
-            v_score = next(c["score"] for c in chunks if c["id"] == v)
-            score_gap = abs(u_score - v_score)
-            # If scores are very close (gap < 2.0), flag the lower one
-            if score_gap < 2.0:
-                loser = u if u_score < v_score else v
-                close_score_flagged.add(loser)
+    max_ret = max(c["score"] for c in chunks)
+    rank1_id = next(c["id"] for c in chunks if c["rank"] == 1)
 
     flagged = {}
     for chunk in chunks:
         cid = chunk["id"]
-        score = trust_scores.get(cid, 0.0)
-        ec = node_edges[cid]
+        wat = trust_scores.get(cid, 0.0)
+
+        support_count = sum(1 for _, _, d in G.edges(cid, data=True) if d["relation"] == "entailment")
+        oppose_count  = sum(1 for _, _, d in G.edges(cid, data=True) if d["relation"] == "contradiction")
 
         # Signal 1: filler text — always flag
         if is_filler_text(chunk["text"]):
             is_suspicious = True
 
-        # Signal 2: retrieval score far below top chunk
-        elif chunk["score"] < max_score * SCORE_RATIO_THRESHOLD:
-            is_suspicious = True
-
-        # Signal 3: involved in contradiction with close-scoring chunk
-        # → the lower scorer is the outlier
-        elif cid in close_score_flagged:
-            is_suspicious = True
-
-        # Signal 4: entailment-only but has MORE entailment edges than
-        # the group average → suspiciously agreeable (paraphrase attack)
-        # flag only if it's a known-similar duplicate (near-zero score gap with top)
+        # Signal 2: WAT score below threshold
+        # AND no support from any other chunk (minority of one)
+        # AND not rank 1 (protect best retrieval match)
         elif (
-            ec["entailment_count"] > 0
-            and ec["contradiction_count"] == 0
-            and chunk["score"] >= max_score * 0.95  # very close to top
-            and chunk["rank"] > 1                    # but not rank 1
+            wat < WAT_THRESHOLD
+            and support_count == 0
+            and cid != rank1_id
         ):
-            # Check if rank 1 chunk has same entailment to it
-            # If so, this is a near-duplicate — flag it
-            rank1_id = next(c["id"] for c in chunks if c["rank"] == 1)
-            if G.has_edge(cid, rank1_id):
-                edge_data = G[cid][rank1_id]
-                if edge_data.get("relation") == "entailment":
-                    is_suspicious = True
-                else:
-                    is_suspicious = False
-            else:
-                is_suspicious = False
+            is_suspicious = True
+
+        # Signal 3: paraphrase duplicate
+        # very close score to rank 1, entailment edge with rank 1 → clone
+        elif (
+            cid != rank1_id
+            and chunk["score"] >= max_ret * 0.95
+            and G.has_edge(cid, rank1_id)
+            and G[cid][rank1_id]["relation"] == "entailment"
+            and support_count >= 1
+            and oppose_count == 0
+        ):
+            is_suspicious = True
 
         else:
             is_suspicious = False
 
         flagged[cid] = {
-            "trust_score": round(score, 4),
+            "trust_score": wat,
             "retrieval_score": round(chunk["score"], 4),
-            "contradiction_count": ec["contradiction_count"],
-            "entailment_count": ec["entailment_count"],
+            "contradiction_count": oppose_count,
+            "entailment_count": support_count,
             "flag": "SUSPICIOUS" if is_suspicious else "TRUSTED",
             "is_known_adversarial": cid in adversarial_ids,
         }
@@ -209,8 +205,8 @@ def ask(question: str, verbose: bool = True) -> dict:
             "claim": extract_claim(r["text"]),
         })
 
-    # 2. Trust scoring via NLI + graph
-    trust_scores, G = compute_trust_scores(chunks)
+    # 2. WAT scoring via NLI + graph
+    trust_scores, G = compute_wat_scores(chunks)
 
     # 3. Flag each chunk
     flagged = flag_chunks(chunks, trust_scores, G)
