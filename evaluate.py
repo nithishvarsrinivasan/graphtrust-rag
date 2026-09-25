@@ -58,20 +58,19 @@ def evaluate_defense_flags(path="defense_results_live.json") -> dict:
 
     total_chunks_seen = 0
     total_flagged = 0
-    false_positives = 0    # real chunks incorrectly flagged
-    true_negatives = 0     # real chunks correctly trusted
-
+    false_positives = 0
+    true_negatives = 0
     adv_retrieved = 0
     adv_flagged = 0
 
     for entry in data:
-        adv_id = entry["adversarial_chunk_id"]
         for c in entry["chunk_results"]:
             total_chunks_seen += 1
+
             if c["flag"] == "SUSPICIOUS":
                 total_flagged += 1
 
-            if c["is_adversarial"]:
+            if c["is_adversarial"]:          # ← reads from chunk-level flag
                 adv_retrieved += 1
                 if c["flag"] == "SUSPICIOUS":
                     adv_flagged += 1
@@ -82,7 +81,8 @@ def evaluate_defense_flags(path="defense_results_live.json") -> dict:
                     true_negatives += 1
 
     precision = safe_div(adv_flagged, adv_flagged + false_positives)
-    recall = safe_div(adv_flagged, adv_retrieved) if adv_retrieved > 0 else None
+    recall = safe_div(adv_flagged, adv_retrieved) if adv_retrieved > 0 else 0.0
+    f1 = safe_div(2 * precision * recall, precision + recall)
 
     return {
         "total_chunks_evaluated": total_chunks_seen,
@@ -91,22 +91,13 @@ def evaluate_defense_flags(path="defense_results_live.json") -> dict:
         "specificity": safe_div(true_negatives, true_negatives + false_positives),
         "adversarial_chunks_retrieved": adv_retrieved,
         "adversarial_chunks_flagged": adv_flagged,
-        "precision_when_applicable": precision if adv_retrieved > 0 else "N/A — adv not retrieved",
-        "recall_when_applicable": recall if recall is not None else "N/A — adv not retrieved",
-        "note": (
-            "Adversarial chunks did not rank in ColBERT top-5 for these questions, "
-            "indicating the attack generation quality (template-based) was insufficient "
-            "to infiltrate retrieval. This is itself a positive finding — the system "
-            "resisted poisoning at the retrieval stage before the defense even activated."
-        )
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
     }
 
 
 def evaluate_retrieval_robustness(path="defense_results_live.json") -> dict:
-    """
-    Measures how well the poisoned index still returns relevant real passages.
-    A poisoned index that retrieves mostly real passages = retrieval robustness.
-    """
     data = json.loads(Path(path).read_text())
 
     total_chunks = 0
@@ -116,7 +107,7 @@ def evaluate_retrieval_robustness(path="defense_results_live.json") -> dict:
     for entry in data:
         for c in entry["chunk_results"]:
             total_chunks += 1
-            if c["is_adversarial"]:
+            if c["is_adversarial"]:          # ← reads from chunk-level flag
                 adv_chunks += 1
             else:
                 real_chunks += 1
@@ -128,7 +119,6 @@ def evaluate_retrieval_robustness(path="defense_results_live.json") -> dict:
         "real_passage_ratio": safe_div(real_chunks, total_chunks),
         "adversarial_infiltration_rate": safe_div(adv_chunks, total_chunks),
     }
-
 
 def problem_statement_verdict(answer_metrics, defense_metrics, retrieval_metrics) -> dict:
     """
@@ -190,14 +180,16 @@ def run_evaluation(
         print(f"  [{icon}] {q['outcome']:<12} | true='{q['true_answer']}' | ans='{q['final_answer'][:60]}'")
 
     # ── Defense flagging ──
-    print("\n── 2. DEFENSE FLAGGING ──")
-    print(f"  Total chunks evaluated: {defense['total_chunks_evaluated']}")
-    print(f"  Real chunks trusted:    {defense['real_chunks_correctly_trusted']} (no false flags)")
-    print(f"  Real chunks mis-flagged:{defense['real_chunks_false_flagged']}")
-    print(f"  Specificity:            {defense['specificity']*100:.1f}% (real chunks correctly left untouched)")
-    print(f"  Adv chunks retrieved:   {defense['adversarial_chunks_retrieved']}")
-    print(f"  Adv chunks flagged:     {defense['adversarial_chunks_flagged']}")
-    print(f"  Precision:              {defense['precision_when_applicable']}")
+    print(f"\n── 2. DEFENSE FLAGGING ──")
+    print(f"  Total chunks evaluated:      {defense['total_chunks_evaluated']}")
+    print(f"  Adversarial chunks retrieved:{defense['adversarial_chunks_retrieved']}")
+    print(f"  Adversarial chunks flagged:  {defense['adversarial_chunks_flagged']}")
+    print(f"  Real chunks correctly trusted:{defense['real_chunks_correctly_trusted']}")
+    print(f"  Real chunks mis-flagged:     {defense['real_chunks_false_flagged']}")
+    print(f"  Precision:                   {defense['precision']*100:.1f}%")
+    print(f"  Recall:                      {defense['recall']*100:.1f}%")
+    print(f"  F1:                          {defense['f1']*100:.1f}%")
+    print(f"  Specificity:                 {defense['specificity']*100:.1f}%")
     print(f"  Note: {defense['note'][:120]}...")
 
     # ── Retrieval robustness ──
