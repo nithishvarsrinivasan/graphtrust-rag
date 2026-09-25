@@ -104,27 +104,16 @@ def compute_trust_scores(chunks: list[dict]) -> dict:
 
 
 def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
-    """
-    Flag only on:
-    1. Filler text pattern (ChatGPT adversarial template) — always suspicious
-    2. Low retrieval score relative to top chunk — adversarial chunks
-       score noticeably lower than the passage ColBERT actually matched
-    NLI trust scores shown for research logging but not used for flagging
-    — too many false positives on topically diverse retrievals.
-    """
     if not chunks:
         return {}
 
-    # Use ColBERT retrieval score as primary signal
     max_score = max(c["score"] for c in chunks)
-    # Chunk is low-confidence if its score is less than 60% of top score
     SCORE_RATIO_THRESHOLD = 0.60
 
-    flagged = {}
+    # Build per-node edge counts
+    node_edges = {}
     for chunk in chunks:
         cid = chunk["id"]
-        score = trust_scores.get(cid, 0.0)
-
         contradiction_count = sum(
             1 for _, _, d in G.edges(cid, data=True)
             if d["relation"] == "contradiction"
@@ -133,14 +122,63 @@ def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
             1 for _, _, d in G.edges(cid, data=True)
             if d["relation"] == "entailment"
         )
+        node_edges[cid] = {
+            "contradiction_count": contradiction_count,
+            "entailment_count": entailment_count,
+        }
 
-        # Signal 1: filler text
+    # Find contradiction pairs where scores are very close
+    # → flag the lower-scoring chunk in the pair
+    close_score_flagged = set()
+    for u, v, d in G.edges(data=True):
+        if d["relation"] == "contradiction":
+            u_score = next(c["score"] for c in chunks if c["id"] == u)
+            v_score = next(c["score"] for c in chunks if c["id"] == v)
+            score_gap = abs(u_score - v_score)
+            # If scores are very close (gap < 2.0), flag the lower one
+            if score_gap < 2.0:
+                loser = u if u_score < v_score else v
+                close_score_flagged.add(loser)
+
+    flagged = {}
+    for chunk in chunks:
+        cid = chunk["id"]
+        score = trust_scores.get(cid, 0.0)
+        ec = node_edges[cid]
+
+        # Signal 1: filler text — always flag
         if is_filler_text(chunk["text"]):
             is_suspicious = True
 
-        # Signal 2: retrieval score too low vs top chunk
+        # Signal 2: retrieval score far below top chunk
         elif chunk["score"] < max_score * SCORE_RATIO_THRESHOLD:
             is_suspicious = True
+
+        # Signal 3: involved in contradiction with close-scoring chunk
+        # → the lower scorer is the outlier
+        elif cid in close_score_flagged:
+            is_suspicious = True
+
+        # Signal 4: entailment-only but has MORE entailment edges than
+        # the group average → suspiciously agreeable (paraphrase attack)
+        # flag only if it's a known-similar duplicate (near-zero score gap with top)
+        elif (
+            ec["entailment_count"] > 0
+            and ec["contradiction_count"] == 0
+            and chunk["score"] >= max_score * 0.95  # very close to top
+            and chunk["rank"] > 1                    # but not rank 1
+        ):
+            # Check if rank 1 chunk has same entailment to it
+            # If so, this is a near-duplicate — flag it
+            rank1_id = next(c["id"] for c in chunks if c["rank"] == 1)
+            if G.has_edge(cid, rank1_id):
+                edge_data = G[cid][rank1_id]
+                if edge_data.get("relation") == "entailment":
+                    is_suspicious = True
+                else:
+                    is_suspicious = False
+            else:
+                is_suspicious = False
 
         else:
             is_suspicious = False
@@ -148,8 +186,8 @@ def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
         flagged[cid] = {
             "trust_score": round(score, 4),
             "retrieval_score": round(chunk["score"], 4),
-            "contradiction_count": contradiction_count,
-            "entailment_count": entailment_count,
+            "contradiction_count": ec["contradiction_count"],
+            "entailment_count": ec["entailment_count"],
             "flag": "SUSPICIOUS" if is_suspicious else "TRUSTED",
             "is_known_adversarial": cid in adversarial_ids,
         }
