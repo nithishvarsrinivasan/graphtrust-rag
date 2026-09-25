@@ -190,7 +190,7 @@ def run_evaluation(
     print(f"  Recall:                      {defense['recall']*100:.1f}%")
     print(f"  F1:                          {defense['f1']*100:.1f}%")
     print(f"  Specificity:                 {defense['specificity']*100:.1f}%")
-    print(f"  Note: {defense['note'][:120]}...")
+    
 
     # ── Retrieval robustness ──
     print("\n── 3. RETRIEVAL ROBUSTNESS (POISONED INDEX) ──")
