@@ -318,7 +318,7 @@ def run_batch_evaluation(
                 "chunk_id": c["id"],
                 "trust_score": c["trust_score"],
                 "flag": c["flag"],
-                "is_adversarial": c["id"] == adv_id,
+                "is_adversarial": c["id"] in adversarial_ids,
             })
 
         adv_chunk = next((c for c in chunk_results if c["is_adversarial"]), None)
