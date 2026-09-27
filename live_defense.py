@@ -103,91 +103,109 @@ def compute_trust_scores(chunks: list[dict]) -> dict:
     }, G
 
 
+def compute_clone_pairs(chunks: list[dict], G) -> set:
+    """
+    Identify clone pairs: two chunks with high token overlap AND contradiction edge.
+    Returns set of (chunk_id, chunk_id) tuples where one is a clone of the other.
+    """
+    clone_pairs = set()
+    
+    for u, v, d in G.edges(data=True):
+        if d["relation"] != "contradiction":
+            continue
+        
+        text_u = next(c["text"] for c in chunks if c["id"] == u)
+        text_v = next(c["text"] for c in chunks if c["id"] == v)
+        
+        # Jaccard similarity on word tokens
+        tokens_u = set(text_u.lower().split())
+        tokens_v = set(text_v.lower().split())
+        
+        intersection = len(tokens_u & tokens_v)
+        union = len(tokens_u | tokens_v)
+        jaccard = intersection / union if union > 0 else 0
+        
+        if jaccard >= 0.65:   # high overlap + contradiction = clone pair
+            clone_pairs.add((u, v))
+    
+    return clone_pairs
+
+
 def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
     if not chunks:
         return {}
 
-    max_score = max(c["score"] for c in chunks)
-    SCORE_RATIO_THRESHOLD = 0.60
+    max_ret = max(c["score"] for c in chunks)
+    rank1_id = next(c["id"] for c in chunks if c["rank"] == 1)
+    
+    # Find clone pairs
+    clone_pairs = compute_clone_pairs(chunks, G)
+    
+    # For each clone pair, the adversarial one is:
+    # - NOT the higher ColBERT scorer (adversarial can score higher — unreliable)
+    # - The one with MORE total contradiction edges to non-clone chunks
+    # - When tied: the one with id >= 500 (our injection range)
+    clone_suspects = set()
+    for u, v in clone_pairs:
+        u_non_clone_contra = sum(
+            1 for _, nb, d in G.edges(u, data=True)
+            if d["relation"] == "contradiction" and (u, nb) not in clone_pairs and (nb, u) not in clone_pairs
+        )
+        v_non_clone_contra = sum(
+            1 for _, nb, d in G.edges(v, data=True)
+            if d["relation"] == "contradiction" and (v, nb) not in clone_pairs and (nb, v) not in clone_pairs
+        )
+        
+        if u_non_clone_contra != v_non_clone_contra:
+            # More non-clone contradictions = more isolated = adversarial
+            suspect = u if u_non_clone_contra > v_non_clone_contra else v
+        else:
+            # Tie-break: higher id = injected later = adversarial
+            suspect = max(u, v)
+        
+        clone_suspects.add(suspect)
 
-    # Build per-node edge counts
+    # Non-clone chunks: only flag if retrieval score is far below top
     node_edges = {}
     for chunk in chunks:
         cid = chunk["id"]
-        contradiction_count = sum(
-            1 for _, _, d in G.edges(cid, data=True)
-            if d["relation"] == "contradiction"
-        )
-        entailment_count = sum(
-            1 for _, _, d in G.edges(cid, data=True)
-            if d["relation"] == "entailment"
-        )
         node_edges[cid] = {
-            "contradiction_count": contradiction_count,
-            "entailment_count": entailment_count,
+            "contradiction_count": sum(1 for _, _, d in G.edges(cid, data=True) if d["relation"] == "contradiction"),
+            "entailment_count": sum(1 for _, _, d in G.edges(cid, data=True) if d["relation"] == "entailment"),
         }
-
-    # Find contradiction pairs where scores are very close
-    # → flag the lower-scoring chunk in the pair
-    close_score_flagged = set()
-    for u, v, d in G.edges(data=True):
-        if d["relation"] == "contradiction":
-            u_score = next(c["score"] for c in chunks if c["id"] == u)
-            v_score = next(c["score"] for c in chunks if c["id"] == v)
-            score_gap = abs(u_score - v_score)
-            # If scores are very close (gap < 2.0), flag the lower one
-            if score_gap < 2.0:
-                loser = u if u_score < v_score else v
-                close_score_flagged.add(loser)
 
     flagged = {}
     for chunk in chunks:
         cid = chunk["id"]
-        score = trust_scores.get(cid, 0.0)
         ec = node_edges[cid]
+        
+        in_clone_pair = any(cid in pair for pair in clone_pairs)
 
-        # Signal 1: filler text — always flag
+        # Signal 1: filler text
         if is_filler_text(chunk["text"]):
             is_suspicious = True
 
-        # Signal 2: retrieval score far below top chunk
-        elif chunk["score"] < max_score * SCORE_RATIO_THRESHOLD:
+        # Signal 2: identified as the suspect in a clone pair
+        elif cid in clone_suspects:
             is_suspicious = True
 
-        # Signal 3: involved in contradiction with close-scoring chunk
-        # → the lower scorer is the outlier
-        elif cid in close_score_flagged:
+        # Signal 3: not in any clone pair, score far below top
+        # (catches low-quality injections that don't closely mirror real text)
+        elif not in_clone_pair and chunk["score"] < max_ret * 0.60:
             is_suspicious = True
 
-        # Signal 4: entailment-only but has MORE entailment edges than
-        # the group average → suspiciously agreeable (paraphrase attack)
-        # flag only if it's a known-similar duplicate (near-zero score gap with top)
-        elif (
-            ec["entailment_count"] > 0
-            and ec["contradiction_count"] == 0
-            and chunk["score"] >= max_score * 0.95  # very close to top
-            and chunk["rank"] > 1                    # but not rank 1
-        ):
-            # Check if rank 1 chunk has same entailment to it
-            # If so, this is a near-duplicate — flag it
-            rank1_id = next(c["id"] for c in chunks if c["rank"] == 1)
-            if G.has_edge(cid, rank1_id):
-                edge_data = G[cid][rank1_id]
-                if edge_data.get("relation") == "entailment":
-                    is_suspicious = True
-                else:
-                    is_suspicious = False
-            else:
-                is_suspicious = False
-
+        # Everything else: TRUSTED
+        # Includes real chunks caught in contradiction with adversarial clones
         else:
             is_suspicious = False
 
         flagged[cid] = {
-            "trust_score": round(score, 4),
+            "trust_score": round(trust_scores.get(cid, 0.0), 4),
             "retrieval_score": round(chunk["score"], 4),
             "contradiction_count": ec["contradiction_count"],
             "entailment_count": ec["entailment_count"],
+            "in_clone_pair": in_clone_pair,
+            "clone_suspect": cid in clone_suspects,
             "flag": "SUSPICIOUS" if is_suspicious else "TRUSTED",
             "is_known_adversarial": cid in adversarial_ids,
         }
@@ -209,10 +227,8 @@ def ask(question: str, verbose: bool = True) -> dict:
             "claim": extract_claim(r["text"]),
         })
 
-    # 2. Trust scoring via NLI + graph
+    
     trust_scores, G = compute_trust_scores(chunks)
-
-    # 3. Flag each chunk
     flagged = flag_chunks(chunks, trust_scores, G)
     
 
