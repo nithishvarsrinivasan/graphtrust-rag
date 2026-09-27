@@ -5,8 +5,6 @@ import spacy
 from pathlib import Path
 from transformers import pipeline as hf_pipeline
 import config
-import re
-from difflib import SequenceMatcher
 
 CONTRADICTION_THRESHOLD = 0.5
 ENTAILMENT_THRESHOLD = 0.5
@@ -73,120 +71,124 @@ FILLER_MARKERS = [
 def is_filler_text(text: str) -> bool:
     return any(marker in text.lower() for marker in FILLER_MARKERS)
 
-def text_similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
+def compute_trust_scores(chunks: list[dict]) -> dict:
+    G = nx.Graph()
+    for chunk in chunks:
+        G.add_node(chunk["id"])
 
-def extract_year(text: str):
-    m = re.search(r"\b(1[6-9]\d{2}|20\d{2})\b", text)
-    return m.group(1) if m else None
+    for i, j in itertools.combinations(range(len(chunks)), 2):
+        ca = chunks[i]["claim"]
+        cb = chunks[j]["claim"]
+        result = classify_pair(ca, cb)
+        scores = result["scores"]
+        label = result["label"]
 
-
-def extract_main_entity(text: str):
-    doc = nlp(text)
-
-    ents = [
-        ent.text.strip()
-        for ent in doc.ents
-        if ent.label_ in {"PERSON", "ORG", "WORK_OF_ART", "GPE", "EVENT"}
-    ]
-
-    if ents:
-        return max(ents, key=len)
-
-    return None
-
-
-def find_clone_pairs(chunks):
-    pairs = []
-
-    for i in range(len(chunks)):
-        for j in range(i + 1, len(chunks)):
-
-            sim = text_similarity(
-                chunks[i]["text"],
-                chunks[j]["text"]
+        if label == "contradiction" and scores["contradiction"] >= CONTRADICTION_THRESHOLD:
+            G.add_edge(
+                chunks[i]["id"], chunks[j]["id"],
+                weight=-scores["contradiction"] * 2,
+                relation="contradiction",
+            )
+        elif label == "entailment" and scores["entailment"] >= ENTAILMENT_THRESHOLD:
+            G.add_edge(
+                chunks[i]["id"], chunks[j]["id"],
+                weight=+scores["entailment"],
+                relation="entailment",
             )
 
-            if sim >= 0.90:
-                pairs.append((i, j, sim))
-
-    return pairs
-
-
-# ── WAT: Weighted Asymmetric Trust ────────────────────────────────────────
-W_SUPPORT    = 1.5
-W_OPPOSE     = 2.0
-W_ISOLATION  = 0.1
-WAT_THRESHOLD = -0.5   # tune this — start here
+    return {
+        node: sum(d["weight"] for _, _, d in G.edges(node, data=True))
+        for node in G.nodes()
+    }, G
 
 
-def compute_wat_scores(chunks):
+def flag_chunks(chunks: list[dict], trust_scores: dict, G) -> dict:
+    if not chunks:
+        return {}
 
-    trust = {}
+    max_score = max(c["score"] for c in chunks)
+    SCORE_RATIO_THRESHOLD = 0.60
 
+    # Build per-node edge counts
+    node_edges = {}
     for chunk in chunks:
-        trust[chunk["id"]] = chunk["score"] / 10.0
+        cid = chunk["id"]
+        contradiction_count = sum(
+            1 for _, _, d in G.edges(cid, data=True)
+            if d["relation"] == "contradiction"
+        )
+        entailment_count = sum(
+            1 for _, _, d in G.edges(cid, data=True)
+            if d["relation"] == "entailment"
+        )
+        node_edges[cid] = {
+            "contradiction_count": contradiction_count,
+            "entailment_count": entailment_count,
+        }
 
-    clone_pairs = find_clone_pairs(chunks)
-
-    for i, j, sim in clone_pairs:
-
-        a = chunks[i]
-        b = chunks[j]
-
-        year_a = extract_year(a["text"])
-        year_b = extract_year(b["text"])
-
-        if (
-            year_a
-            and year_b
-            and year_a != year_b
-        ):
-
-            if a["score"] >= b["score"]:
-                trust[a["id"]] += 2.0
-                trust[b["id"]] -= 2.0
-            else:
-                trust[b["id"]] += 2.0
-                trust[a["id"]] -= 2.0
-
-    return trust, clone_pairs
-
-def flag_chunks(chunks, trust_scores, clone_pairs):
+    # Find contradiction pairs where scores are very close
+    # → flag the lower-scoring chunk in the pair
+    close_score_flagged = set()
+    for u, v, d in G.edges(data=True):
+        if d["relation"] == "contradiction":
+            u_score = next(c["score"] for c in chunks if c["id"] == u)
+            v_score = next(c["score"] for c in chunks if c["id"] == v)
+            score_gap = abs(u_score - v_score)
+            # If scores are very close (gap < 2.0), flag the lower one
+            if score_gap < 2.0:
+                loser = u if u_score < v_score else v
+                close_score_flagged.add(loser)
 
     flagged = {}
-
-    clone_lookup = {}
-
-    for i, j, sim in clone_pairs:
-
-        cid_a = chunks[i]["id"]
-        cid_b = chunks[j]["id"]
-
-        clone_lookup.setdefault(cid_a, []).append(cid_b)
-        clone_lookup.setdefault(cid_b, []).append(cid_a)
-
     for chunk in chunks:
-
         cid = chunk["id"]
+        score = trust_scores.get(cid, 0.0)
+        ec = node_edges[cid]
 
-        trust = trust_scores[cid]
-
-        suspicious = False
-
+        # Signal 1: filler text — always flag
         if is_filler_text(chunk["text"]):
-            suspicious = True
+            is_suspicious = True
 
-        elif trust < 0:
-            suspicious = True
+        # Signal 2: retrieval score far below top chunk
+        elif chunk["score"] < max_score * SCORE_RATIO_THRESHOLD:
+            is_suspicious = True
+
+        # Signal 3: involved in contradiction with close-scoring chunk
+        # → the lower scorer is the outlier
+        elif cid in close_score_flagged:
+            is_suspicious = True
+
+        # Signal 4: entailment-only but has MORE entailment edges than
+        # the group average → suspiciously agreeable (paraphrase attack)
+        # flag only if it's a known-similar duplicate (near-zero score gap with top)
+        elif (
+            ec["entailment_count"] > 0
+            and ec["contradiction_count"] == 0
+            and chunk["score"] >= max_score * 0.95  # very close to top
+            and chunk["rank"] > 1                    # but not rank 1
+        ):
+            # Check if rank 1 chunk has same entailment to it
+            # If so, this is a near-duplicate — flag it
+            rank1_id = next(c["id"] for c in chunks if c["rank"] == 1)
+            if G.has_edge(cid, rank1_id):
+                edge_data = G[cid][rank1_id]
+                if edge_data.get("relation") == "entailment":
+                    is_suspicious = True
+                else:
+                    is_suspicious = False
+            else:
+                is_suspicious = False
+
+        else:
+            is_suspicious = False
 
         flagged[cid] = {
-            "trust_score": round(trust, 4),
+            "trust_score": round(score, 4),
             "retrieval_score": round(chunk["score"], 4),
-            "contradiction_count": 0,
-            "entailment_count": len(clone_lookup.get(cid, [])),
-            "flag": "SUSPICIOUS" if suspicious else "TRUSTED",
+            "contradiction_count": ec["contradiction_count"],
+            "entailment_count": ec["entailment_count"],
+            "flag": "SUSPICIOUS" if is_suspicious else "TRUSTED",
             "is_known_adversarial": cid in adversarial_ids,
         }
 
@@ -207,11 +209,11 @@ def ask(question: str, verbose: bool = True) -> dict:
             "claim": extract_claim(r["text"]),
         })
 
-    
-    trust_scores, clone_pairs = compute_wat_scores(chunks)
+    # 2. Trust scoring via NLI + graph
+    trust_scores, G = compute_trust_scores(chunks)
 
     # 3. Flag each chunk
-    flagged = flag_chunks(chunks,trust_scores,clone_pairs)
+    flagged = flag_chunks(chunks, trust_scores, G)
     
 
     # 4. Build clean context from trusted chunks only
